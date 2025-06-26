@@ -56,6 +56,8 @@ DB's /Broker
 
 Encryption
 =============
+
+AES Encryption At Rest.
 WAF
 TLS/SSL Everywhere
 CDN
@@ -83,4 +85,4 @@ Testing
 1. Owasp/ZAP  - DAST
 2. SonarQube - SAST
 3. Trivy - SAST
-4. Synk -
+4. Synk - Only Mentioned in Diagram
