@@ -1,0 +1,86 @@
+Infra Components Technical Architecture
+========================================
+
+=======================
+Azure
+dev, qa, uat
+
+=======================
+AWS,GCP OnPremise 
+uat
+
+Automation
+========================
+IAC - Teraform
+Deployment - HELM 
+
+
+========================
+
+Logging & Monitoring
+---------------------
+
+Logging 
+=============
+
+1. OpenSearch 
+2. Logstash
+3. File beat
+4. Kibana
+
+Monitoring 
+==============
+1. OpenTelemetry 
+2. Prometheus
+3. Grafana 
+
+Observeability/Tracing
+=======================
+
+1. Open Telemetry 
+2. OpenSearch
+3. Jaegar
+
+
+Container Registery
+=======================
+Cloud Native
+
+DB's /Broker
+=========================
+1. Postgres 
+2. MongoDB Cluster
+3. KAFKA 
+4. Redis
+ 
+
+Encryption
+=============
+WAF
+TLS/SSL Everywhere
+CDN
+HashiCorp Vault
+
+K8s Service
+===============
+Frontend Service - NextJs
+Backend Service - Python (FastAPI) 
+FE to BE - Vault
+BE to BE - Vault
+BE to Third Party - Vautl
+
+CI/CD
+================
+Azure Repo's
+Azure DevOps
+
+Storage
+===========
+MiniIO SDK - Missing + Native Cloud Storage
+
+Testing
+=====================
+1. Owasp/ZAP  - DAST
+2. SonarQube - SAST
+3. Trivy - SAST
+4. Synk -
