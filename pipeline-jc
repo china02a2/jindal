@@ -1,0 +1,318 @@
+trigger: none
+pr: none
+# branches:
+#   include:
+#     - dev
+#     - qa
+#     - postqa
+
+parameters:
+  - name: envFile
+    type: string
+    default: 'cp-dev-env'
+    values:
+      - cp-dev-env
+      - cp-qa-env
+      - cp-postqa-env
+      
+variables:
+  acr_repository_name: 'dev_survey_cp'
+  acr_container_registry: 'devacrsurvey.azurecr.io'
+  imageTag: '$(Build.SourceBranchName)-$(Build.BuildId)'
+  sonarProjectKey: '$(Build.Repository.Name)-$(Build.SourceBranchName)'
+  sonarProjectName: '$(Build.Repository.Name) - $(Build.SourceBranchName)'
+  SONARQUBE_SRC-DIR: '$(System.DefaultWorkingDirectory)/src/components/project-studies/survey'
+  SONARQUBE_EXCLUSION: '*/*Dockerfile,*/*azure-pipeline,*/_tests_/, */.test.tsx, */.test.ts, */*.spec.tsx'
+  devFrontendUrl: 'https://survey-dev.keltbazudev.jaspercolin.com/'
+  qaFrontendUrl: 'https://survey-qa.keltbazudev.jaspercolin.com/'
+  postqaFrontendUrl: 'https://survey-postqa.keltbazudev.jaspercolin.com/'
+
+  # --- Dynamically set AKS vars by branch ---
+  ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+    AKSdeploymentName: 'survey-cp-dev'
+    AKScontainerName: 'survey-cp-dev'
+  ${{ if eq(variables['Build.SourceBranchName'], 'qa') }}:
+    AKSdeploymentName: 'survey-cp-qa'
+    AKScontainerName: 'survey-cp-qa'
+  ${{ if eq(variables['Build.SourceBranchName'], 'postqa') }}:
+    AKSdeploymentName: 'survey-cp'
+    AKScontainerName: 'survey-cp'
+
+stages:
+  # ---------- 🔍 Sonar Scan - 🛠️ Build Push - 🔐 Trivy Scan - 🚀 Deploy to AKS ----------
+  - stage: AnalyzeAndBuild
+    displayName: 'Checkout - SonarQube - Build - Trivy'
+    jobs:
+      - job: AnalyzeBuildPush
+        displayName: 'Sonar Scan, Build, Push & Trivy Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout Source Code'
+
+          - task: DownloadSecureFile@1
+            name: DownloadEnv
+            inputs:
+              secureFile: ${{ parameters.envFile }}
+            displayName: 'Download Secure .env file'
+
+          - bash: |
+              echo "🔧 Selected .env file: ${{ parameters.envFile }}"
+              cp "$(Agent.TempDirectory)/${{ parameters.envFile }}" "$(Build.SourcesDirectory)/.env"
+              ls -la $(Build.SourcesDirectory)
+            displayName: '✅ Copy .env to repo root'
+
+          - task: SonarQubePrepare@7
+            displayName: 'Prepare SonarQube Analysis'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+            inputs:
+              SonarQube: 'sonarqube-service-connection'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: '$(sonarProjectKey)'
+              cliProjectName: '$(sonarProjectName)'
+              extraProperties: |
+                sonar.projectVersion=$(Build.BuildId)
+                sonar.sources= $(SONARQUBE_SRC-DIR)
+                sonar.exclusions= $(SONARQUBE_EXCLUSION)
+                sonar.language=py
+                sonar.sourceEncoding=UTF-8
+
+          - bash: |
+              FILTERED=$(echo "$SONARQUBE_SCANNER_PARAMS" | sed 's/"sonar.branch.name":"[^"]",//g')
+              echo "##vso[task.setvariable variable=SONARQUBE_SCANNER_PARAMS]$FILTERED"
+            displayName: 'Fix sonar.branch.name for Community Edition'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+
+          - script: |
+              sudo apt-get update
+              sudo apt-get install -y unzip openjdk-17-jre-headless
+              wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+              unzip sonar-scanner-cli-5.0.1.3006-linux.zip
+              mv sonar-scanner-5.0.1.3006-linux /opt/sonar-scanner
+              export PATH=$PATH:/opt/sonar-scanner/bin
+              sonar-scanner
+            displayName: 'Install & Run SonarScanner CLI'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+
+          - task: SonarQubePublish@7
+            displayName: 'Publish SonarQube Report'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+            inputs:
+              pollingTimeoutSec: '300'
+
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              containerRegistry: 'devacrsurvey-connection'
+              repository: '$(acr_repository_name)'
+              command: buildAndPush
+              dockerfile: '**/Dockerfile'
+              tags: |
+                $(imageTag)
+
+          - script: |
+              echo "Built and pushed Docker image: $(acr_container_registry)/$(acr_repository_name):$(imageTag)"
+            displayName: 'Display built image info'
+
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+              export PATH="$PATH:$(pwd)/bin"
+              trivy --version
+              DATE=$(date +'%Y-%m-%d_%H-%M-%S')
+              REPORT_FILE="trivy-report-$DATE.html"
+              wget https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -O html.tpl
+              trivy image \
+                --format template \
+                --template "@html.tpl" \
+                -o $REPORT_FILE \
+                $(acr_container_registry)/$(acr_repository_name):$(imageTag)
+              echo "##vso[task.setvariable variable=TRIVY_REPORT_FILE]$REPORT_FILE"
+            displayName: 'Run Trivy and Generate HTML Report'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Trivy HTML Report'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+            inputs:
+              PathtoPublish: '$(TRIVY_REPORT_FILE)'
+              ArtifactName: 'TrivyHtmlReport'
+              publishLocation: 'Container'
+
+  - stage: Deploy
+    displayName: 'Deploy to AKS via Jumpbox'
+    dependsOn: AnalyzeAndBuild
+    condition: succeeded()
+    jobs:
+      - job: DeployEnv
+        displayName: 'Deploy to AKS cluster'
+        condition: "or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))"
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: SSH@0
+            displayName: 'SSH into Jumpbox and Deploy'
+            inputs:
+              sshEndpoint: 'bastion-ssh-connection'
+              runOptions: 'inline'
+              inline: |
+                NAMESPACE="$(Build.SourceBranchName)"
+                kubectl set image deployment/$(AKSdeploymentName) $(AKScontainerName)=$(acr_container_registry)/$(acr_repository_name):$(imageTag) -n $NAMESPACE
+                kubectl get deployment $(AKSdeploymentName) -n $NAMESPACE -o yaml
+
+          - script: |
+              case "$(Build.SourceBranchName)" in
+                dev) export ZAP_TARGET_URL="$(devFrontendUrl)" ;;
+                qa) export ZAP_TARGET_URL="$(qaFrontendUrl)" ;;
+                postqa) export ZAP_TARGET_URL="$(postqaFrontendUrl)" ;;
+                *) exit 1 ;;
+              esac
+              DATE=$(date +'%Y-%m-%d_%H-%M-%S')
+              ZAP_REPORT_HTML="zap_report-$DATE.html"
+              WORK_DIR="$(Agent.TempDirectory)/zap"
+              mkdir -p "$WORK_DIR"
+              docker run --rm -v "$WORK_DIR":/zap/wrk/:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "$ZAP_TARGET_URL" -r "$ZAP_REPORT_HTML"
+              echo "##vso[task.setvariable variable=ZAP_REPORT_PATH]$WORK_DIR/$ZAP_REPORT_HTML"
+            displayName: 'Run OWASP ZAP Scan (Env Aware)'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish ZAP HTML Report'
+            condition: succeeded()
+            inputs:
+              PathtoPublish: '$(ZAP_REPORT_PATH)'
+              ArtifactName: 'ZAPHtmlReport'
+              publishLocation: 'Container'
+==============================================================================================
+trigger: none
+  # branches:
+  #   include:
+  #     - dev
+  #     - qa
+  #     - postqa
+
+variables:
+  acr_repository_name: 'dev_survey_service'
+  acr_container_registry: 'devacrsurvey.azurecr.io'
+  imageTag: '$(Build.SourceBranchName)-$(Build.BuildId)'
+  sonarProjectKey: '$(Build.Repository.Name)-$(Build.SourceBranchName)'
+  sonarProjectName: '$(Build.Repository.Name) - $(Build.SourceBranchName)'
+  SONARQUBE_SRC-DIR: '$(System.DefaultWorkingDirectory)/survey_service/app'
+  SONARQUBE_EXCLUSION: '*/*Dockerfile,*/*azure-pipeline,*/_pycache_/,/alembic/,/tests/,/.pyc'
+
+  ${{ if eq(variables['Build.SourceBranchName'], 'dev') }}:
+    AKSdeploymentName: 'survey-service-dev'
+    AKScontainerName: 'survey-service-dev'
+  ${{ if eq(variables['Build.SourceBranchName'], 'qa') }}:
+    AKSdeploymentName: 'survey-service-qa'
+    AKScontainerName: 'survey-service-qa'
+  ${{ if eq(variables['Build.SourceBranchName'], 'postqa') }}:
+    AKSdeploymentName: 'survey-service'
+    AKScontainerName: 'survey-service'
+
+stages:
+  - stage: AnalyzeAndBuild
+    displayName: 'Checkout - SonarQube - Build - Trivy'
+    jobs:
+      - job: AnalyzeBuildPush
+        displayName: 'Sonar Scan, Build, Push & Trivy Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout Source Code'
+
+          - task: SonarQubePrepare@7
+            displayName: 'Prepare SonarQube Analysis'
+            condition: or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))
+            inputs:
+              SonarQube: 'sonarqube-service-connection'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: '$(sonarProjectKey)'
+              cliProjectName: '$(sonarProjectName)'
+              extraProperties: |
+                sonar.projectVersion=$(Build.BuildId)
+                sonar.sources= $(SONARQUBE_SRC-DIR)
+                sonar.exclusions= $(SONARQUBE_EXCLUSION)
+                sonar.language=py
+                sonar.sourceEncoding=UTF-8
+
+          - bash: |
+              FILTERED=$(echo "$SONARQUBE_SCANNER_PARAMS" | sed 's/"sonar.branch.name":"[^"]",//g')
+              echo "##vso[task.setvariable variable=SONARQUBE_SCANNER_PARAMS]$FILTERED"
+            displayName: 'Fix sonar.branch.name for Community Edition'
+
+          - script: |
+              sudo apt-get update
+              sudo apt-get install -y unzip openjdk-17-jre-headless
+              wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+              unzip sonar-scanner-cli-5.0.1.3006-linux.zip
+              mv sonar-scanner-5.0.1.3006-linux /opt/sonar-scanner
+              export PATH=$PATH:/opt/sonar-scanner/bin
+              sonar-scanner
+            displayName: 'Install & Run SonarScanner CLI'
+
+          - task: SonarQubePublish@7
+            displayName: 'Publish SonarQube Report'
+            inputs:
+              pollingTimeoutSec: '300'
+
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              containerRegistry: 'devacrsurvey-connection'
+              repository: '$(acr_repository_name)'
+              command: buildAndPush
+              dockerfile: '**/Dockerfile'
+              tags: |
+                $(imageTag)
+
+          - script: |
+              echo "Built and pushed Docker image: $(acr_container_registry)/$(acr_repository_name):$(imageTag)"
+            displayName: 'Display built image info'   
+
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+              export PATH="$PATH:$(pwd)/bin"
+              trivy --version
+              DATE=$(date +'%Y-%m-%d_%H-%M-%S')
+              REPORT_FILE="trivy-report-$DATE.html"
+              wget https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -O html.tpl
+              trivy image \
+                --format template \
+                --template "@html.tpl" \
+                -o $REPORT_FILE \
+                $(acr_container_registry)/$(acr_repository_name):$(imageTag)
+              echo "##vso[task.setvariable variable=TRIVY_REPORT_FILE]$REPORT_FILE"
+            displayName: "Run Trivy and Generate HTML Report"
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Trivy HTML Report'
+            inputs:
+              PathtoPublish: '$(TRIVY_REPORT_FILE)'
+              ArtifactName: 'TrivyHtmlReport'
+              publishLocation: 'Container'
+
+  - stage: Deploy
+    displayName: 'Deploy to AKS via Jumpbox'
+    dependsOn: AnalyzeAndBuild
+    condition: succeeded()
+    jobs:
+      - job: DeployEnv
+        displayName: 'Deploy to AKS cluster'
+        condition: "or(eq(variables['Build.SourceBranchName'], 'dev'), eq(variables['Build.SourceBranchName'], 'qa'), eq(variables['Build.SourceBranchName'], 'postqa'))"
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: SSH@0
+            displayName: 'SSH into Jumpbox and Deploy'
+            inputs:
+              sshEndpoint: 'bastion-ssh-connection'
+              runOptions: 'inline'
+              inline: |
+                NAMESPACE="$(Build.SourceBranchName)"
+                kubectl set image deployment/$(AKSdeploymentName) $(AKScontainerName)=$(acr_container_registry)/$(acr_repository_name):$(imageTag) -n $NAMESPACE
+                kubectl get deployment $(AKSdeploymentName) -n $NAMESPACE -o yaml
+==================================================================================
+
